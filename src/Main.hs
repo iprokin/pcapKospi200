@@ -15,30 +15,56 @@
         https://hackage.haskell.org/package/binary-0.9.0.0/docs/Data-Binary-Get.html
 -}
 
-
 module Main where
 
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import qualified Data.ByteString.Lazy.Char8 as CL
---import qualified Data.ByteString.Lazy.Char8 as C
---import Data.Binary.Get (Get, runGet, getWord64le, getInt32be, getWord32le, getWord32be, getWord16be, getWord8)
-import Data.Binary.Get
+import Data.Binary.Get (Get, runGet, getWord32le, getWord16be, getWord8, getLazyByteString, skip, isEmpty)
 import Data.Word (Word64, Word32, Word16, Word8)
 import Data.Int (Int32)
 import Data.Char (ord)
+import Data.Maybe
+import Data.List (intercalate)
 
-{-
-data PriceVol = PriceVol
-    { price :: Word32
-    , vol   :: Word64
-    } deriving Show
--}
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
+import Data.Time.Clock (UTCTime)
+
+import System.Environment (getArgs)
 
 --lenEthHeader = 14
 --lenIP4Header = 20
 lenEthAndIP4 = 34
+idString = "B6034"
+lenPack  = 215
+breakerBString = BL.pack $ map (fromIntegral . ord) idString
+endOfMessage = 255 :: Word8
+
+
+data HeaderPcapPacket = HeaderPcapPacket
+    { tsSecPcap   :: Word32
+    , tsUsecPcap  :: Word32
+    , inclLenPcap :: Word32
+    , origLenPcap :: Word32
+    } deriving (Show)
+
+
+data HeaderUDPpacket = HeaderUDPpacket
+    { sourcePortUDP :: Word16
+    , destPortUDP   :: Word16
+    , dataLenUDP    :: Word16
+    , chkSumUDP     :: Word16
+    } deriving (Show)
+
+
+data ContentQuotePacket = ContentQuotePacket
+    { issueCodeC  :: String
+    , bidsC       :: [PriceVol]
+    , asksC       :: [PriceVol]
+    , acceptTimeC :: String
+    } deriving Show
+
 
 data PriceVol = PriceVol
     { price :: Double
@@ -47,18 +73,29 @@ data PriceVol = PriceVol
 instance Show PriceVol where
     show x = (show $ vol x) ++ "@" ++ (show $ price x)
 
+
 data DataLine = DataLine
     { packetTime :: Integer
-    , acceptTime :: Integer
+    , acceptTime :: String
     , issueCode  :: String
     , bids       :: [PriceVol]
     , asks       :: [PriceVol]
-    } deriving Show
+    }
+instance Show DataLine where
+    show x = intercalate sep $
+        [ show $ posixSecondsToUTCTime $ fromIntegral $ packetTime x
+        , acceptTime x
+        , issueCode x
+        , intercalate sep $ map show $ bids x
+        , intercalate sep $ map show $ asks x
+        ]
+        where sep = "\t"
 
---getQuotePacket
---getPriceVol = PriceVol <$> getWord32le <*> getWord64le
---getPriceVol = PriceVol <$> getWord32be <*> getWord64be
---getPriceVol = PriceVol <$> (getByteString 5) <*> (getByteString 7)
+
+splitEvery :: Int -> [a] -> [[a]]
+splitEvery n = takeWhile (not.null) . map (take n) . iterate (drop n)
+
+
 getPriceVol :: Get PriceVol
 getPriceVol = do
     price <- getLazyByteString 5
@@ -82,20 +119,6 @@ data HeaderPcapGlobal = HeaderPcapGlobal
     , network      :: Word32
     } deriving (Show)
 -}
-
-data HeaderPcapPacket = HeaderPcapPacket
-    { tsSecPcap   :: Word32
-    , tsUsecPcap  :: Word32
-    , inclLenPcap :: Word32
-    , origLenPcap :: Word32
-    } deriving (Show)
-
-data HeaderUDPpacket = HeaderUDPpacket
-    { sourcePortUDP :: Word16
-    , destPortUDP   :: Word16
-    , totalLenUDP   :: Word16
-    , chkSumUDP     :: Word16
-    } deriving (Show)
 
 {-
 getHeaderPcapGlobal :: Get HeaderPcapGlobal
@@ -134,33 +157,6 @@ getHeaderUDP = do
     chkSum     <- getWord16be
     return $ HeaderUDPpacket sourcePort destPort (totalLen-8) chkSum
 
-idString = "B6034"
-lenPack  = 215
-
-breakerBString = BL.pack $ map (fromIntegral . ord) idString
-
-searchSubtringPosition sub str = stmp 0 0 sub str
-    where
-        stmp 5 pos _ _                 = pos
-        stmp n pos su st
-            | st == BL.empty           = 0
-            | BL.head su /= BL.head st = stmp 0 (pos+n+1) sub (BL.tail st)
-            | otherwise                = stmp (n+1) pos (BL.tail su) (BL.tail st)
-
-{-
-searchBBS bs c
-  | BL.take 5 c == bs = s
-  | otherwise         = searchBBS bs (BL.tail c)
-  where
-      s = BL.dropWhile (/= fromIntegral (BL.head bs)) c
--}
-
-data ContentQuotePacket = ContentQuotePacket
-    { issueCodeC  :: String
-    , bidsC       :: [PriceVol]
-    , asksC       :: [PriceVol]
-    , acceptTimeC :: String
-    } deriving Show
 
 getContentQuotePacket :: Get ContentQuotePacket
 getContentQuotePacket = do
@@ -181,134 +177,101 @@ getContentQuotePacket = do
         , acceptTimeC = CL.unpack acceptTime
         }
 
-getDataLine :: Get (Maybe DataLine)
+getDataLine :: Get (Int, Maybe DataLine)
 getDataLine = do
     headerPcap <- getHeaderPcapPacket
     skip lenEthAndIP4
     headerUDP  <- getHeaderUDP
-    let lenUDP = fromIntegral $ totalLenUDP headerUDP
+    let lenUDP = fromIntegral $ dataLenUDP headerUDP
     dataId     <- getLazyByteString 5
     -- read only packets we're looking for, skip otherwise
     if CL.unpack dataId == idString && lenUDP == lenPack
        then do
            contentP   <- getContentQuotePacket
-           let dataL =
+           let timeNicer = (intercalate ":") . (splitEvery 2)
+               dataL =
                    DataLine
-                       { packetTime = 0
-                       , acceptTime = 0
+                       { packetTime = fromIntegral $ tsSecPcap headerPcap
+                       , acceptTime = timeNicer $ acceptTimeC contentP
                        , issueCode  = issueCodeC contentP
                        , bids       = reverse (bidsC contentP)
                        , asks       = asksC contentP
                        }
-           return (Just dataL)
+           eOm <- getWord8
+           if eOm == endOfMessage
+              then return (lenUDP, (Just dataL))
+              else error "Bad termination !!!"--return (lenUDP, Nothing)
        else do
            skip lenUDP
-           return Nothing
+           return (lenUDP, Nothing)
 
 
-{-
-test4 c | lenC >= lenD = (dataL : test4 cnext)
-        | otherwise    = []
--}
-
---getPriceVolAll :: Get [PriceVol]
---getPriceVolAll = mapM (\_ -> getPriceVol) [1..5]
-{-
-getData :: Get [Maybe DataLine]
-getData = do
+getData1 :: Get [(Int, Maybe DataLine)]
+getData1 = do
   empty <- isEmpty
   if empty
     then return []
     else do line  <- getDataLine
-            lines <- getData
+            lines <- getData1
             return (line:lines)
--}
 
-getData :: ByteString -> [DataLine]
-getData c = gd (length c) c
+getData :: BL.ByteString -> [DataLine]
+getData c = map fromJust $ filter isJust $ gd (BL.length c) c
     where
-        
+        gd n c | n > lenM  = dataL : gd (n-lenA) (BL.drop lenA c)
+               | otherwise = []
+               where
+                   lenU = foldl (+) 0 $
+                       [ lenPcapH
+                       , fromIntegral lenEthAndIP4
+                       , lenUDPh
+                       ]
+                   lenA      = lenU + fromIntegral lenUDPd
+                   lenM      = lenU + lenMaxUDP
+                   lenPcapH  = 16
+                   lenUDPh   = 8
+                   lenMaxUDP = 600
+                   (lenUDPd, dataL) = runGet getDataLine c
 
-incrementalExample :: BL.ByteString -> [Maybe DataLine]
-incrementalExample input0 = go decoder input0
-  where
-      decoder = runGetIncremental getData
-      go :: Decoder Maybe DataLine -> BL.ByteString -> [Maybe DataLine]
-      go (Done leftover _consumed trade) input
-        = trade : go decoder (BL.chunk leftover input)
-      go (Partial k) input
-        = go (k . takeHeadChunk $ input) (dropHeadChunk input)
-      go (Fail _leftover _consumed msg) _input
-        = error msg
 
 test4 contentsWithoutGlobalPcap = do
-    mapM_ print $ runGet getData contentsWithoutGlobalPcap
-{-
-repeatPriceVol 0 qData = []
-repeatPriceVol n qData = runGet getPriceVol qData : repeatPriceVol (n-1) (BL.drop 12 qData)
--}
+    --mapM_ print $ runGet getData contentsWithoutGlobalPcap
+    mapM_ print $ getData contentsWithoutGlobalPcap
 
-test3 :: BL.ByteString -> IO ()
-test3 c = do
-    let weird = do
-        headerPcap <- getHeaderPcapPacket
-        skip lenEthAndIP4
-        headerUDP  <- getHeaderUDP
-        contentP   <- getContentQuotePacket
-        return contentP
-    print $ runGet weird c
-
-
-
-test2 :: Integer -> BL.ByteString -> IO ()
-test2 n contentsWithoutGlobalPcap = do
-    if contentsWithoutGlobalPcap == BL.empty || n <= 0
-       then return ()
-       else do
-           --print $ runGet getHeaderPcapGlobal contents
-           let line = runGet getDataLine contentsWithoutGlobalPcap
-           print line
-           test2 (n-1) contentsWithoutGlobalPcap
-
-test1 :: Integer -> BL.ByteString -> IO ()
-test1 n contentsWithoutGlobalPcap = do
-    if contentsWithoutGlobalPcap == BL.empty || n <= 0
-       then return ()
-       else do
-           --print $ runGet getHeaderPcapGlobal contents
-
-           --print $ BL.take 5 $ searchBBS breakerBString c
-
-           let p = searchSubtringPosition breakerBString contentsWithoutGlobalPcap
-           -- 16 pcap header, 8 udp header
-           let contentsPcapUDPdata = BL.drop (p-16-8) contentsWithoutGlobalPcap
-           let contentsUDPdata = BL.drop 16 contentsPcapUDPdata
-
-           let headerPcap = runGet getHeaderPcapPacket contentsPcapUDPdata
-           let headerUDP = runGet getHeaderUDP contentsUDPdata
-           let contentData = BL.drop 8 contentsUDPdata
-
-           let res = runGet getContentQuotePacket contentData
-
-           print res
-           print n
-           print (BL.length contentData)
-           print "    "
-
-           test1 (n-1) (BL.drop 215 contentData)
-
-main :: IO ()
-main = do
+t :: (CL.ByteString -> IO ()) -> IO ()
+t testf = do
     let file = "/home/ilya/Downloads/mdf-kospi200.20110216-0.pcap"
     contents <- BL.readFile file
     let contentsWithoutGlobalPcap = BL.drop 24 contents
+    testf contentsWithoutGlobalPcap
 
-    test4 contentsWithoutGlobalPcap
-    --test3 contentsWithoutGlobalPcap
 
-    --print $ parseLines contentsWithoutGlobalPcap
-    --print $ repeatPriceVol 5 $ BL.drop 7 quoteData
 
-    --print $ runGet getHeaderUDP (BL.drop (16+34) contentsWithoutGlobalPcap)
-    --print $ filter ((==155) . (`quot` 100) . snd) $ map (\x -> (x, destPort $ runGet getHeaderUDP (BL.drop (24+16+x) contents))) [1..2000]
+reorder = undefined
 
+rP contents = getData contentsWithoutGlobalPcap
+    where contentsWithoutGlobalPcap = BL.drop 24 contents
+
+helpM :: String
+helpM = 
+    "Please call with:\n"++
+    indent ++ myName ++ " {file}\n"++
+    "Alternatively, if you want to reorder records, call with:\n"++
+    indent ++ myName ++ " -r {file}"
+    where myName = "pcapKospi200"
+          indent = "\t"
+
+main :: IO ()
+main = do
+    let printL = mapM_ print
+    args <- getArgs
+    case args of
+      (f:[])    -> do
+          c <- BL.readFile f
+          printL $ rP c
+      (f:p:_)   -> do
+          c <- BL.readFile f
+          if p == "-r"
+             then printL $ reorder $ rP c
+             else printL $ rP c
+      otherwise -> putStrLn helpM
