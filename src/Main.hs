@@ -206,13 +206,43 @@ getDataLine = do
            return Nothing
 
 
+{-
+test4 c | lenC >= lenD = (dataL : test4 cnext)
+        | otherwise    = []
+-}
+
 --getPriceVolAll :: Get [PriceVol]
 --getPriceVolAll = mapM (\_ -> getPriceVol) [1..5]
-getDataLine :: Get [Maybe DataLine]
+{-
+getData :: Get [Maybe DataLine]
 getData = do
-    getDataLine
-    getData
+  empty <- isEmpty
+  if empty
+    then return []
+    else do line  <- getDataLine
+            lines <- getData
+            return (line:lines)
+-}
 
+getData :: ByteString -> [DataLine]
+getData c = gd (length c) c
+    where
+        
+
+incrementalExample :: BL.ByteString -> [Maybe DataLine]
+incrementalExample input0 = go decoder input0
+  where
+      decoder = runGetIncremental getData
+      go :: Decoder Maybe DataLine -> BL.ByteString -> [Maybe DataLine]
+      go (Done leftover _consumed trade) input
+        = trade : go decoder (BL.chunk leftover input)
+      go (Partial k) input
+        = go (k . takeHeadChunk $ input) (dropHeadChunk input)
+      go (Fail _leftover _consumed msg) _input
+        = error msg
+
+test4 contentsWithoutGlobalPcap = do
+    mapM_ print $ runGet getData contentsWithoutGlobalPcap
 {-
 repeatPriceVol 0 qData = []
 repeatPriceVol n qData = runGet getPriceVol qData : repeatPriceVol (n-1) (BL.drop 12 qData)
@@ -266,9 +296,6 @@ test1 n contentsWithoutGlobalPcap = do
            print "    "
 
            test1 (n-1) (BL.drop 215 contentData)
-
-test4 contentsWithoutGlobalPcap = do
-    print $ runGet getData
 
 main :: IO ()
 main = do
