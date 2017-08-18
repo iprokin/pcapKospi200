@@ -18,28 +18,34 @@
 module Main where
 
 import qualified Data.ByteString.Lazy as BL
-import qualified Data.ByteString as B
-import qualified Data.ByteString.Char8 as C
 import qualified Data.ByteString.Lazy.Char8 as CL
+
 import Data.Binary.Get (Get, runGet, getWord32le, getWord16be, getWord8, getLazyByteString, skip, isEmpty)
 import Data.Word (Word64, Word32, Word16, Word8)
-import Data.Int (Int32)
-import Data.Char (ord)
-import Data.Maybe
+import GHC.Int (Int64)
+
+import Data.Maybe (Maybe, fromJust, isJust)
+--import Data.List.Stream
 import Data.List (intercalate)
 
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Time.Clock (UTCTime)
+import Data.Char (ord)
 
 import System.Environment (getArgs)
 
 --lenEthHeader = 14
 --lenIP4Header = 20
-lenEthAndIP4 = 34
-idString = "B6034"
-lenPack  = 215
+idString       = "B6034"
 breakerBString = BL.pack $ map (fromIntegral . ord) idString
-endOfMessage = 255 :: Word8
+lenTargetUDP   = 215
+endOfMessage   = 255 :: Word8
+
+lenPcapGlobH   = 24 :: Int64
+lenPcapH       = 16 :: Int64
+lenEthAndIP4   = 34 :: Int64
+lenUDPh        = 8  :: Int64
+lenHeaders     = lenPcapH + lenEthAndIP4 + lenUDPh
 
 
 data HeaderPcapPacket = HeaderPcapPacket
@@ -75,7 +81,7 @@ instance Show PriceVol where
 
 
 data DataLine = DataLine
-    { packetTime :: Integer
+    { packetTime :: Double
     , acceptTime :: String
     , issueCode  :: String
     , bids       :: [PriceVol]
@@ -83,7 +89,7 @@ data DataLine = DataLine
     }
 instance Show DataLine where
     show x = intercalate sep $
-        [ show $ posixSecondsToUTCTime $ fromIntegral $ packetTime x
+        [ show $ posixSecondsToUTCTime $ realToFrac $ packetTime x
         , acceptTime x
         , issueCode x
         , intercalate sep $ map show $ bids x
@@ -177,6 +183,7 @@ getContentQuotePacket = do
         , acceptTimeC = CL.unpack acceptTime
         }
 
+{-
 getDataLine :: Get (Int, Maybe DataLine)
 getDataLine = do
     headerPcap <- getHeaderPcapPacket
@@ -185,13 +192,15 @@ getDataLine = do
     let lenUDP = fromIntegral $ dataLenUDP headerUDP
     dataId     <- getLazyByteString 5
     -- read only packets we're looking for, skip otherwise
-    if CL.unpack dataId == idString && lenUDP == lenPack
+    if CL.unpack dataId == idString && lenUDP == lenTargetUDP
        then do
            contentP   <- getContentQuotePacket
            let timeNicer = (intercalate ":") . (splitEvery 2)
                dataL =
                    DataLine
-                       { packetTime = fromIntegral $ tsSecPcap headerPcap
+                       { packetTime =
+                           (fromIntegral $ tsSecPcap headerPcap)
+                           + (fromIntegral $ tsUsecPcap headerPcap) * 1e-6
                        , acceptTime = timeNicer $ acceptTimeC contentP
                        , issueCode  = issueCodeC contentP
                        , bids       = reverse (bidsC contentP)
@@ -204,8 +213,40 @@ getDataLine = do
        else do
            skip lenUDP
            return (lenUDP, Nothing)
+-}
+getDataLineFromTargetPacket :: Get (Maybe DataLine)
+getDataLineFromTargetPacket = do
+    headerPcap <- getHeaderPcapPacket
+    skip (fromIntegral lenEthAndIP4)
+    headerUDP  <- getHeaderUDP
+    let lenUDP = fromIntegral $ dataLenUDP headerUDP
+    dataId     <- getLazyByteString 5
+    contentP   <- getContentQuotePacket
+    eOm        <- getWord8
+    let isGood = foldl (&&) True $
+            [ CL.unpack dataId == idString     -- indeed target packet
+            , lenUDP           == lenTargetUDP -- has lenghts of target
+            , eOm              == endOfMessage -- terminated ok
+            ]
+    if isGood
+       then do
+           let timeNicer = (intercalate ":") . (splitEvery 2)
+               dataL = DataLine
+                   { packetTime =
+                       (fromIntegral $ tsSecPcap headerPcap)
+                       + (fromIntegral $ tsUsecPcap headerPcap) * 1e-6
+                   , acceptTime = timeNicer $ acceptTimeC contentP
+                   , issueCode  = issueCodeC contentP
+                   , bids       = reverse (bidsC contentP)
+                   , asks       = asksC contentP
+                   }
+           return (Just dataL)
+       else do
+           --skip lenUDP
+           return Nothing
 
 
+{-
 getData1 :: Get [(Int, Maybe DataLine)]
 getData1 = do
   empty <- isEmpty
@@ -232,17 +273,48 @@ getData c = map fromJust $ filter isJust $ gd (BL.length c) c
                    lenUDPh   = 8
                    lenMaxUDP = 600
                    (lenUDPd, dataL) = runGet getDataLine c
+-}
+
+-- When the first element of substring is found,
+-- continue comaring elementwise and counting symbols that match
+-- When all symbols, we stop.
+searchSubtringPosition sub str = stmp 0 0 sub str
+    where
+        stmp n pos su st
+            | n  == lsub               = pos
+            | st == BL.empty           = error "Empty ByteString"
+            | BL.head su /= BL.head st = stmp 0 (pos+n+1) sub (BL.tail st)
+            | otherwise                = stmp (n+1) pos (BL.tail su) (BL.tail st)
+        lsub = BL.length sub
+
+test0 = do
+    let file = "/home/ilya/Downloads/mdf-kospi200.20110216-0.pcap"
+    contents <- BL.readFile file
+    let contentsWithoutGlobalPcap = BL.drop lenPcapGlobH contents
+    print $ searchSubtringPosition breakerBString contentsWithoutGlobalPcap
+
+getFirstTargetPacket :: BL.ByteString -> BL.ByteString
+getFirstTargetPacket c = BL.drop (p-lenHeaders) c
+    where p = searchSubtringPosition breakerBString c
 
 
+getData contents = map fromJust . filter isJust . gD $ getFirstTargetPacket contents
+    where
+        gD c = gd c : gD cnext
+            where cnext = getFirstTargetPacket $ BL.drop (lenHeaders+lenBS) c
+                  lenBS = BL.length breakerBString
+                  gd = runGet getDataLineFromTargetPacket
+
+{-
 test4 contentsWithoutGlobalPcap = do
     --mapM_ print $ runGet getData contentsWithoutGlobalPcap
     mapM_ print $ getData contentsWithoutGlobalPcap
-
+-}
 t :: (CL.ByteString -> IO ()) -> IO ()
 t testf = do
     let file = "/home/ilya/Downloads/mdf-kospi200.20110216-0.pcap"
     contents <- BL.readFile file
-    let contentsWithoutGlobalPcap = BL.drop 24 contents
+    let contentsWithoutGlobalPcap = BL.drop lenPcapGlobH contents
     testf contentsWithoutGlobalPcap
 
 
@@ -250,7 +322,7 @@ t testf = do
 reorder = undefined
 
 rP contents = getData contentsWithoutGlobalPcap
-    where contentsWithoutGlobalPcap = BL.drop 24 contents
+    where contentsWithoutGlobalPcap = BL.drop lenPcapGlobH contents
 
 helpM :: String
 helpM = 
@@ -260,6 +332,7 @@ helpM =
     indent ++ myName ++ " -r {file}"
     where myName = "pcapKospi200"
           indent = "\t"
+
 
 main :: IO ()
 main = do
