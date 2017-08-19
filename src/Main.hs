@@ -10,6 +10,7 @@
     Reading pcap
         https://serverfault.com/questions/38626/how-can-i-read-pcap-files-in-a-friendly-format
         tcpdump -qns 0 -X -r mdf-kospi200.20110216-0.pcap | less
+        Wireshark-gtk
     Dealing with Binary in Haskell
         https://wiki.haskell.org/Dealing_with_binary_data
         https://hackage.haskell.org/package/binary-0.9.0.0/docs/Data-Binary-Get.html
@@ -24,14 +25,13 @@ import qualified Data.ByteString.Lazy.Internal as L (chunk, ByteString(Chunk, Em
 import qualified Data.ByteString.Lazy.Char8 as CL
 
 import Data.Binary.Get (Get, Decoder (Done, Partial, Fail), runGetIncremental, getWord32le, getWord16be, getWord8, getLazyByteString, skip, isEmpty)
---import Data.Binary.Get
 import Data.Word (Word32, Word16, Word8)
+import GHC.Int (Int64)
 
 import Data.Maybe (Maybe, fromJust, isJust)
 import Data.Function (on)
---import Data.List.Stream
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
-import Data.Time.Clock (UTCTime (utctDay))
+import Data.Time.Clock (UTCTime)
 import Data.List (intercalate, sortBy, groupBy)
 import Data.Char (ord)
 
@@ -43,16 +43,17 @@ import System.Environment (getArgs)
 --lenIP4Header  = 20
 idString        = "B6034" :: String
 endOfMessage    = 255     :: Word8
-lenQuotePack    = 215
+lenQuotePack    = 215     :: Int
 
-lenPcapGlobH    = 24      :: Int
+lenPcapGlobH    = 24      :: Int64
 lenPcapH        = 16      :: Int
 lenEthAndIP4    = 34      :: Int
 lenUDPh         = 8       :: Int
 lenHeaders      = lenPcapH + lenEthAndIP4 + lenUDPh
 
-pcapTsUsecUnits = 1e-6    :: Double
+pcapTsUsecUnits = 1e-6    :: Double -- microseconds
 
+-- DATA
 
 data HeaderPcapPacket = HeaderPcapPacket
     { tsSecPcap   :: Word32
@@ -104,9 +105,12 @@ instance Show DataLine where
         where sep = "\t"
 
 
-splitEvery :: Int -> [a] -> [[a]]
-splitEvery n = takeWhile (not.null) . map (take n) . iterate (drop n)
+-- FUNCTIONS
 
+splitEvery :: Int -> [a] -> [[a]]
+splitEvery n = takeWhile (not . null) . map (take n) . iterate (drop n)
+
+-- Binary data parsers
 
 getPriceVol :: Get PriceVol
 getPriceVol = do
@@ -114,7 +118,7 @@ getPriceVol = do
     vol   <- getLazyByteString 7
     return PriceVol
         { price = read (CL.unpack price) :: Double
-        , vol   = read (CL.unpack vol) :: Double
+        , vol   = read (CL.unpack vol)   :: Double
         }
 
 getPriceVolAll :: Get [PriceVol]
@@ -171,7 +175,7 @@ getDataLine = do
            return Nothing
        else do
            -- Read assuming it's a good packet --
-           skip (fromIntegral lenEthAndIP4)
+           skip lenEthAndIP4
            headerUDP  <- getHeaderUDP
            let lenUDP = fromIntegral $ dataLenUDP headerUDP
            dataId     <- getLazyByteString 5
@@ -181,11 +185,8 @@ getDataLine = do
            -- If it wasn't skip this packet
            let isGood =
                    (CL.unpack dataId == idString)     && -- indeed target packet
-                       (lenUDP       == lenQuotePack) && -- has lenght of target
-                           (eOm      == endOfMessage)    -- terminated ok
-
-
-     
+                   (lenUDP           == lenQuotePack) && -- has length of target
+                   (eOm              == endOfMessage)    -- terminated ok
            if isGood
               then do
                   let timeNicer = intercalate ":" . splitEvery 2
@@ -202,7 +203,9 @@ getDataLine = do
               else
                   return Nothing
 
--- Taken from https://hackage.haskell.org/package/binary-0.9.0.0/docs/Data-Binary-Get.html
+-- Incremental parser for the whole binary stream
+
+-- Modified from https://hackage.haskell.org/package/binary-0.9.0.0/docs/Data-Binary-Get.html
 getDataLines :: BL.ByteString -> [DataLine]
 getDataLines input0 = map fromJust $ filter isJust $ go decoder input0
   where
@@ -214,44 +217,39 @@ getDataLines input0 = map fromJust $ filter isJust $ go decoder input0
           go (k . takeHeadChunk $ input) (dropHeadChunk input)
       go Fail{} _ = []
 
--- Taken from https://hackage.haskell.org/package/binary-0.9.0.0/docs/Data-Binary-Get.html
+-- Modified from https://hackage.haskell.org/package/binary-0.9.0.0/docs/Data-Binary-Get.html
 takeHeadChunk :: BL.ByteString -> Maybe B.ByteString
 takeHeadChunk lbs =
-  case lbs of
-    (L.Chunk bs _) -> Just bs
-    _ -> Nothing
+    case lbs of
+      (L.Chunk bs _) -> Just bs
+      _              -> Nothing
 
--- Taken from https://hackage.haskell.org/package/binary-0.9.0.0/docs/Data-Binary-Get.html
+-- Modified from https://hackage.haskell.org/package/binary-0.9.0.0/docs/Data-Binary-Get.html
 dropHeadChunk :: BL.ByteString -> BL.ByteString
 dropHeadChunk lbs =
-  case lbs of
-    (L.Chunk _ lbs') -> lbs'
-    _ -> L.Empty
-
---reorder = undefined
---reorder = sortBy (compare `on` acceptTime)
+    case lbs of
+      (L.Chunk _ lbs') -> lbs'
+      _                -> L.Empty
 
 -- Group by Timestamp with bins of size acceptanceDelay [seconds].
 -- Inside each group (each time bin), sort by acceptTime
 -- This leaves crossings between groups unsorted
--- To solve this, we can repeate grouping and sorting using bins of acceptanceDelay size, but shifted by half of acceptanceDelay.
--- The later sorts overlaps between groups.
--- This is not the most efficient way, but will work as long as acceptanceDelay is chosen well.
+-- To solve this, we can repeat grouping and sorting.
+-- Using bins of the same size, but shifted by half of acceptanceDelay, we can sort overlaps between groups.
+-- This is not the most efficient way, but it will work as long as acceptanceDelay is well for the data.
 reorder :: [DataLine] -> [DataLine]
 reorder = reorderS (acceptanceDelay `quot` 2) . reorderS 0
     where
         reorderS :: Integer -> [DataLine] -> [DataLine]
-        reorderS shift = concatMap sortGroup . grouped shift
-        sortGroup = sortBy (compare `on` acceptTime)
-        --packetTimestampToDay = utctDay . posixSecondsToUTCTime . realToFrac . packetTimestamp
-        --grouped = groupBy ((==) `on` packetTimestampToDay)
-        grouped :: Integer -> [DataLine] -> [[DataLine]]
-        grouped shift 
-            = groupBy
-                ((==) `on`
-                    ((`quot` acceptanceDelay) .
-                        (+shift) . truncate . packetTimestamp))
-        acceptanceDelay = 2 -- chose so that it is even
+        reorderS shift  = concatMap sortGroup . grouped shift
+        sortGroup       = sortBy (compare `on` acceptTime)
+        grouped  :: Integer -> [DataLine] -> [[DataLine]]
+        grouped shift   = groupBy ((==) `on` timeBin shift)
+            where timeBin shift =
+                    (`quot` acceptanceDelay) .  (+shift) . truncate . packetTimestamp
+        acceptanceDelay = 2 -- [seconds]. Choose so that it is even
+
+-- User interaction
 
 helpMessage :: String
 helpMessage = 
@@ -266,7 +264,7 @@ readTransformPrint :: ([DataLine] -> [DataLine]) -> (BL.ByteString -> BL.ByteStr
 readTransformPrint transformD transformC f =
     let printL = mapM_ print
         rP contents = getDataLines contentsWithoutGlobalPcap
-            where contentsWithoutGlobalPcap = BL.drop (fromIntegral lenPcapGlobH) contents
+            where contentsWithoutGlobalPcap = BL.drop lenPcapGlobH contents
      in do
         c <- BL.readFile f
         printL $ transformD $ rP (transformC c)
@@ -278,6 +276,7 @@ main = do
       []          -> putStrLn helpMessage
       (f:"-r":_)  -> readTransformPrint reorder id f
       ("-r":f:_)  -> readTransformPrint reorder id f
+      -- TEST with infinite file
       ("-tr":f:_) -> readTransformPrint reorder BL.cycle f
       ("-t":f:_)  -> readTransformPrint id BL.cycle f
       (f:_)       -> readTransformPrint id id f
