@@ -4,7 +4,7 @@ version:             0.1.0.0
 -- description:
 homepage:            https://github.com/iprokin/pcapKospi200
 license:             BSD3
---license-file:        LICENSE
+license-file:        LICENSE
 author:              Ilya Prokin
 maintainer:          isprokin@gmail.com
 copyright:           2017 Ilya Prokin
