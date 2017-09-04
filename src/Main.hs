@@ -1,3 +1,6 @@
+-- Ilya Prokin <isprokin@gmail.com>
+-- Code Excercise - Tsuru Capital Application
+
 {-
  REFERENCES
     pcap format description
@@ -51,7 +54,7 @@ lenEthAndIP4    = 34      :: Int
 lenUDPh         = 8       :: Int
 lenHeaders      = lenPcapH + lenEthAndIP4 + lenUDPh
 
-pcapTsUsecUnits = 1e-6    :: Double -- microseconds
+pcapTsUsecUnits = 1e-6    :: Double -- to transform microseconds to seconds
 
 -- DATA
 
@@ -89,10 +92,10 @@ instance Show PriceVol where
 
 data DataLine = DataLine
     { packetTimestamp :: Double
-    , acceptTime :: String
-    , issueCode  :: String
-    , bids       :: [PriceVol]
-    , asks       :: [PriceVol]
+    , acceptTime      :: String
+    , issueCode       :: String
+    , bids            :: [PriceVol]
+    , asks            :: [PriceVol]
     }
 instance Show DataLine where
     show x = intercalate sep
@@ -146,13 +149,13 @@ getHeaderUDP = do
 getContentQuotePacket :: Get ContentQuotePacket
 getContentQuotePacket = do
     issueCode  <- getLazyByteString 12
-    --SKIP    Issue seq.-no. 3, Market Status Type 2, Total bid quote volume 7
+    -- SKIP  Issue seq.-no. 3, Market Status Type 2, Total bid quote volume 7
     skip 12
     bids       <- getPriceVolAll
-    -- SKIP Total ask quote volume 7
+    -- SKIP  Total ask quote volume 7
     skip 7
     asks       <- getPriceVolAll
-    -- SKIP     No. of best bid/ask valid quotes 50
+    -- SKIP  No. of best bid/ask valid quotes 50
     skip 50
     acceptTime <- getLazyByteString 8
     return ContentQuotePacket
@@ -166,7 +169,7 @@ getContentQuotePacket = do
 getDataLine :: Get (Maybe DataLine)
 getDataLine = do
     headerPcap <- getHeaderPcapPacket
-    -- Read header a see if data packet is of interest to us
+    -- Read header and see if data packet is of interest to us
     let pcapPackLen = fromIntegral $ inclLenPcap headerPcap
     if pcapPackLen /= lenEthAndIP4 + lenUDPh + lenQuotePack
         -- If packet has a wrong size skip it
@@ -211,8 +214,8 @@ getDataLines input0 = map fromJust $ filter isJust $ go decoder input0
   where
       decoder = runGetIncremental getDataLine
       go :: Decoder (Maybe DataLine) -> BL.ByteString -> [Maybe DataLine]
-      go (Done leftover _ trade) input =
-          trade : go decoder (L.chunk leftover input)
+      go (Done leftover _ d) input =
+          d : go decoder (L.chunk leftover input)
       go (Partial k) input =
           go (k . takeHeadChunk $ input) (dropHeadChunk input)
       go Fail{} _ = []
@@ -231,12 +234,13 @@ dropHeadChunk lbs =
       (L.Chunk _ lbs') -> lbs'
       _                -> L.Empty
 
+-- Reordering
 -- Group by Timestamp with bins of size acceptanceDelay [seconds].
 -- Inside each group (each time bin), sort by acceptTime
--- This leaves crossings between groups unsorted
+-- This leaves border parts between groups unsorted
 -- To solve this, we can repeat grouping and sorting.
--- Using bins of the same size, but shifted by half of acceptanceDelay, we can sort overlaps between groups.
--- This is not the most efficient way, but it will work as long as acceptanceDelay is well for the data.
+-- Using bins of the same size, but shifted by half of acceptanceDelay, we can sort around borders between groups.
+-- This is not the most efficient way, but it will work as long as acceptanceDelay is selected well for the data.
 reorder :: [DataLine] -> [DataLine]
 reorder = reorderS (acceptanceDelay `quot` 2) . reorderS 0
     where
@@ -262,7 +266,7 @@ helpMessage =
 
 readTransformPrint :: ([DataLine] -> [DataLine]) -> (BL.ByteString -> BL.ByteString) -> String -> IO ()
 readTransformPrint transformD transformC f =
-    let printL = mapM_ print
+    let printL      = mapM_ print
         rP contents = getDataLines contentsWithoutGlobalPcap
             where contentsWithoutGlobalPcap = BL.drop lenPcapGlobH contents
      in do
@@ -274,9 +278,11 @@ main = do
     args <- getArgs
     case args of
       []          -> putStrLn helpMessage
+      -- Run with reordering
       (f:"-r":_)  -> readTransformPrint reorder id f
       ("-r":f:_)  -> readTransformPrint reorder id f
-      -- TEST with infinite file
+      -- TEST with an input file transformed to the infinite file
       ("-tr":f:_) -> readTransformPrint reorder BL.cycle f
       ("-t":f:_)  -> readTransformPrint id BL.cycle f
+      -- Run as usual
       (f:_)       -> readTransformPrint id id f
